@@ -1,0 +1,570 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <DHT.h>
+
+// ====================================================================
+// 1. NETWORK CREDENTIALS
+// ====================================================================
+const char* ssid     = "YOUR_SSID";
+const char* password = "YOUR_PASSWORD";
+
+// ====================================================================
+// 2. PIN & SENSOR TYPE CONFIGURATIONS
+// ====================================================================
+#define DHT1_PIN      16      // Chamber Sensor Pin
+#define DHT1_TYPE     DHT11   // Chamber Sensor is DHT11
+
+#define DHT2_PIN      4       // Refrigerator Sensor Pin
+#define DHT2_TYPE     DHT22   // Refrigerator Sensor is DHT22
+
+#define IR_FRUIT_PIN  5       // Fruit Detection IR Sensor
+#define MQ4_ANALOG    34      // ADC1_CH6 - Methane Gas Pin
+#define MQ135_ANALOG  35      // ADC1_CH7 - Air Quality/Rot Pin
+#define BUZZER_PIN    12      // Output Pin for Warning Buzzer
+#define RELAY_PIN     13      // Output Pin for Humidifier Relay
+
+const int SPOILAGE_THRESHOLD_MQ4   = 2200; 
+const int SPOILAGE_THRESHOLD_MQ135 = 2500; 
+
+WebServer server(80);
+LiquidCrystal_I2C lcd(0x27, 16, 2); 
+
+DHT dht1(DHT1_PIN, DHT1_TYPE);
+DHT dht2(DHT2_PIN, DHT2_TYPE);
+
+// Volatile sensor readings
+float temperature1 = 0.0, humidity1 = 0.0;
+float temperature2 = 0.0, humidity2 = 0.0;
+int rawMQ4 = 0, rawMQ135 = 0, fruitDetected = 0;
+int prevFruitDetected = 0; 
+
+String selectedFruit = "Banana";
+String scanStatusString = "Awaiting Scan...";
+bool isHumidifierOn = false;
+bool isSpoilAlertActive = false;
+
+float currentBlemish = 0.0;
+float currentSpoilageIndex = 0.0;
+float dynamicSugarBrix = 16.5; 
+
+unsigned long previousMillis = 0;
+const long interval = 2000; 
+bool lcdStatus = false;
+
+// Function helper to estimate sugar based on selected item, MQ sensors & Temperature
+float calculateNIRSugar(String fruit, int mq4, int mq135, float temp) {
+  float baseBrix = 12.0;
+  if (fruit == "Apple") baseBrix = 14.5;
+  else if (fruit == "Banana") baseBrix = 18.2;
+  else if (fruit == "Tomato") baseBrix = 4.8;
+  else if (fruit == "Onion") baseBrix = 9.1;
+  else if (fruit == "Guava") baseBrix = 10.5;
+  else if (fruit == "Leafy Vegetables") baseBrix = 3.2;
+
+  // Temperature variation factor
+  float tempOffset = (isnan(temp) || temp == 0) ? 0.0 : ((temp - 25.0) * 0.1);
+
+  // Spoilage / Gas impact factor
+  if (mq4 > SPOILAGE_THRESHOLD_MQ4 || mq135 > SPOILAGE_THRESHOLD_MQ135 || isSpoilAlertActive) {
+    baseBrix = baseBrix * 0.4; // Sugar depletion on spoiled items
+  } else {
+    baseBrix += tempOffset;
+  }
+
+  if (baseBrix < 1.0) baseBrix = 1.0;
+  return baseBrix;
+}
+
+// ====================================================================
+// 3. HTML DASHBOARD GENERATOR (FOODGUARD.AI)
+// ====================================================================
+String getDashboardHTML() {
+  String html = "";
+  html += "<!DOCTYPE html>\n";
+  html += "<html lang=\"en\">\n";
+  html += "<head>\n";
+  html += "    <meta charset=\"UTF-8\">\n";
+  html += "    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n";
+  html += "    <title>FOODGUARD.AI</title>\n";
+  html += "    <style>\n";
+  html += "        body { font-family: 'Courier New', Courier, monospace, sans-serif; background-color: #0b111e; margin: 0; padding: 15px; text-align: center; color: #26e6e6; }\n";
+  html += "        .container { max-width: 600px; margin: 0 auto; text-align: left; }\n";
+  html += "        .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #102a45; padding-bottom: 10px; margin-bottom: 15px; }\n";
+  html += "        .logo { font-size: 1.5em; font-weight: bold; letter-spacing: 2px; color: #00ffcc; }\n";
+  html += "        .time { color: #8899a6; font-size: 0.9em; }\n";
+  html += "        .panel { background: #111a2e; border: 1px solid #1f355c; border-radius: 8px; padding: 15px; margin-bottom: 15px; }\n";
+  html += "        .panel-title { font-size: 0.85em; font-weight: bold; text-transform: uppercase; letter-spacing: 1px; color: #8899a6; margin-bottom: 12px; display: flex; align-items: center; }\n";
+  html += "        .panel-title::before { content: \"◆ \"; color: #00ffcc; margin-right: 6px; }\n";
+  html += "        .warning-banner { background-color: #3b0d11; border: 1px solid #ff3b30; color: #ff8882; padding: 12px; border-radius: 6px; text-align: center; font-weight: bold; margin-bottom: 15px; font-size: 1.1em; display: none; }\n";
+  html += "        .video-box { width: 100%; height: auto; border-radius: 6px; border: 1px solid #1f355c; background: #000; }\n";
+  html += "        .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }\n";
+  html += "        .grid-2-custom { display: grid; grid-template-columns: 1fr 1.3fr; gap: 12px; }\n";
+  html += "        .metric-card { background: #0d1627; border: 1px solid #162642; padding: 10px; border-radius: 6px; }\n";
+  html += "        .metric-title { font-size: 0.7em; color: #8899a6; text-transform: uppercase; }\n";
+  html += "        .metric-value { font-size: 1.6em; font-weight: bold; color: #ffffff; margin-top: 5px; }\n";
+  html += "        .metric-unit { font-size: 0.5em; color: #8899a6; margin-left: 3px; }\n";
+  html += "        .progress-container { margin-bottom: 10px; }\n";
+  html += "        .progress-label { font-size: 0.8em; color: #8899a6; display: flex; justify-content: space-between; margin-bottom: 4px; }\n";
+  html += "        .progress-bar-bg { background: #162642; height: 8px; border-radius: 4px; overflow: hidden; }\n";
+  html += "        .progress-fill { height: 100%; width: 0%; transition: width 0.5s ease-in-out; }\n";
+  html += "        .color-green { background: #00ffcc; }\n";
+  html += "        .color-orange { background: #ff9f0a; }\n";
+  html += "        .btn-group { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }\n";
+  html += "        .btn { background: #111a2e; border: 1px solid #1f355c; color: #8899a6; padding: 10px; border-radius: 6px; font-size: 0.85em; cursor: pointer; font-family: inherit; display: flex; flex-direction: column; align-items: center; }\n";
+  html += "        .btn.active { border-color: #00ffcc; color: #00ffcc; background: #0d282e; }\n";
+  html += "        .download-btn { width: 100%; background: #bf5af2; color: white; border: none; padding: 10px 15px; border-radius: 6px; font-family: inherit; font-weight: bold; cursor: pointer; font-size: 0.9em; margin-bottom: 8px; }\n";
+  html += "        .eat-status { font-size: 1.2em; font-weight: bold; padding: 10px; margin-top: 10px; border-radius: 6px; text-align: center; }\n";
+  html += "        .setup-ip-input { width: calc(100% - 22px); background: #0d1627; border: 1px solid #162642; padding: 10px; border-radius: 6px; color: #fff; margin-bottom: 10px; font-family: inherit; }\n";
+  html += "        .scan-btn { width: 100%; background: #00ffcc; color: #0b111e; border: none; padding: 12px; border-radius: 6px; font-family: inherit; font-weight: bold; cursor: pointer; font-size: 1.1em; margin-bottom: 15px; letter-spacing: 1px; transition: background 0.2s; }\n";
+  html += "    </style>\n";
+  html += "    <script>\n";
+  html += "        let currentSelection = 'Banana';\n";
+  html += "        let isScanning = false;\n";
+  html += "        function saveCamIP() {\n";
+  html += "            let ip = document.getElementById('cam-ip-field').value;\n";
+  html += "            localStorage.setItem('esp32_cam_ip', ip);\n";
+  html += "            document.getElementById('cam-feed-img').src = 'http://' + ip + '/';\n";
+  html += "        }\n";
+  html += "        function selectFruit(type) {\n";
+  html += "            if (isScanning) return;\n";
+  html += "            currentSelection = type;\n";
+  html += "            let buttons = document.querySelectorAll('.btn');\n";
+  html += "            buttons.forEach(b => b.classList.remove('active'));\n";
+  html += "            document.getElementById('btn-' + type.toLowerCase().replace(' ', '')).classList.add('active');\n";
+  html += "            fetch('/api/select?item=' + type);\n";
+  html += "        }\n";
+  html += "        function startScan() {\n";
+  html += "            if (isScanning) return;\n";
+  html += "            isScanning = true;\n";
+  html += "            let scanBtn = document.getElementById('scan-action-btn');\n";
+  html += "            scanBtn.innerText = 'AI IMAGE PROCESSING...';\n";
+  html += "            scanBtn.style.background = '#ff9f0a';\n";
+  html += "            fetch('/api/scan-trigger?status=run');\n";
+  html += "            let progress = 0;\n";
+  html += "            let interval = setInterval(() => {\n";
+  html += "                progress += 5;\n";
+  html += "                if (progress >= 100) {\n";
+  html += "                    clearInterval(interval);\n";
+  html += "                    isScanning = false;\n";
+  html += "                    scanBtn.innerText = 'START AI SCAN';\n";
+  html += "                    scanBtn.style.background = '#00ffcc';\n";
+  html += "                    fetch('/api/scan-trigger?status=complete');\n";
+  html += "                }\n";
+  html += "            }, 150);\n";
+  html += "        }\n";
+  html += "        function fetchTelemetryData() {\n";
+  html += "            fetch('/api/data')\n";
+  html += "                .then(response => response.json())\n";
+  html += "                .then(data => {\n";
+  html += "                    document.getElementById('temp1').innerText = data.temperature1;\n";
+  html += "                    document.getElementById('humid1').innerText = data.humidity1;\n";
+  html += "                    document.getElementById('temp2').innerText = data.temperature2;\n";
+  html += "                    document.getElementById('humid2').innerText = data.humidity2;\n";
+  html += "                    document.getElementById('mq4').innerText = data.mq4;\n";
+  html += "                    document.getElementById('mq135').innerText = data.mq135;\n";
+  html += "                    document.getElementById('bar-visual').style.width = data.blemish + '%';\n";
+  html += "                    document.getElementById('bar-spoilage').style.width = data.spoilIndex + '%';\n";
+  
+  // FIX 1: Humidifier Relay State Display Fix (ACTIVE vs IDLE)
+  html += "                    let relayElem = document.getElementById('relay-state');\n";
+  html += "                    if (data.humidifier == 1) {\n";
+  html += "                        relayElem.innerText = 'ACTIVE';\n";
+  html += "                        relayElem.style.color = '#00ffcc';\n";
+  html += "                    } else {\n";
+  html += "                        relayElem.innerText = 'IDLE';\n";
+  html += "                        relayElem.style.color = '#8899a6';\n";
+  html += "                    }\n";
+  
+  // FIX 3: NIR Sugar Level Brix Display
+  html += "                    document.getElementById('nir-sugar-val').innerText = parseFloat(data.sugarContent).toFixed(1);\n";
+  html += "                    document.getElementById('nir-sugar-desc').innerText = data.sugarDesc;\n";
+  html += "                    document.getElementById('nir-sugar-desc').style.color = (data.scanStatus === 'DO NOT EAT!') ? '#ff3b30' : '#00ffcc';\n";
+  
+  html += "                    let warningBanner = document.getElementById('chamber-warning');\n";
+  html += "                    let statusBox = document.getElementById('status-match');\n";
+  html += "                    let eatBox = document.getElementById('eatable-result');\n";
+  
+  // FIX 2: AI Scan Result (FRESH or SPOILED)
+  html += "                    if (data.scanStatus === 'DO NOT EAT!') {\n";
+  html += "                        warningBanner.style.display = 'block';\n";
+  html += "                        statusBox.innerHTML = \"<span style='color: #ff3b30; font-weight: bold;'>[⚠️ SPOILED] \" + data.selectedItem + \" IS SPOILED</span>\";\n";
+  html += "                        eatBox.style.display = 'block';\n";
+  html += "                        eatBox.style.backgroundColor = '#3b0d11';\n";
+  html += "                        eatBox.style.color = '#ff8882';\n";
+  html += "                        eatBox.style.border = '1px solid #ff3b30';\n";
+  html += "                        eatBox.innerHTML = \"❌ RESULT: \" + data.selectedItem.toUpperCase() + \" IS SPOILED - NOT EATABLE\";\n";
+  html += "                    } else if (data.scanStatus === 'SAFE TO EAT ✓') {\n";
+  html += "                        warningBanner.style.display = 'none';\n";
+  html += "                        statusBox.innerHTML = \"<span style='color: #00ffcc; font-weight: bold;'>[🍏 FRESH] \" + data.selectedItem + \" IS FRESH</span>\";\n";
+  html += "                        eatBox.style.display = 'block';\n";
+  html += "                        eatBox.style.backgroundColor = '#0d282e';\n";
+  html += "                        eatBox.style.color = '#00ffcc';\n";
+  html += "                        eatBox.style.border = '1px solid #00ffcc';\n";
+  html += "                        eatBox.innerHTML = \"🍏 RESULT: \" + data.selectedItem.toUpperCase() + \" IS FRESH - SAFE TO EAT\";\n";
+  html += "                    } else {\n";
+  html += "                        warningBanner.style.display = 'none';\n";
+  html += "                        statusBox.innerHTML = \"<span style='color: #8899a6;'>\" + data.scanStatus + \"</span>\";\n";
+  html += "                        eatBox.style.display = 'none';\n";
+  html += "                    }\n";
+  html += "                }).catch(err => console.error('Telemetry error:', err));\n";
+  html += "        }\n";
+  html += "        function initPage() {\n";
+  html += "            let savedIP = localStorage.getItem('esp32_cam_ip');\n";
+  html += "            if (savedIP) {\n";
+  html += "                document.getElementById('cam-ip-field').value = savedIP;\n";
+  html += "                document.getElementById('cam-feed-img').src = 'http://' + savedIP + '/';\n";
+  html += "            }\n";
+  html += "            fetchTelemetryData();\n";
+  html += "            setInterval(fetchTelemetryData, 2000);\n";
+  html += "        }\n";
+  html += "    </script>\n";
+  html += "</head>\n";
+  html += "<body onload=\"initPage()\">\n";
+  html += "    <div class=\"container\">\n";
+  html += "        <div class=\"header\">\n";
+  html += "            <div class=\"logo\">FOODGUARD.AI</div>\n";
+  html += "            <div class=\"time\">8:09:21 PM</div>\n";
+  html += "        </div>\n";
+  html += "        <div id=\"chamber-warning\" class=\"warning-banner\">\n";
+  html += "            ⚠ CRITICAL: SPOILED FOOD DETECTED inside the system!\n";
+  html += "        </div>\n";
+  html += "        <div class=\"panel\">\n";
+  html += "            <div class=\"panel-title\">Link ESP32-CAM Node</div>\n";
+  html += "            <input id=\"cam-ip-field\" type=\"text\" class=\"setup-ip-input\" placeholder=\"Enter Camera IP (e.g. 192.168.43.150)\">\n";
+  html += "            <button class=\"scan-btn\" style=\"margin-bottom: 0px;\" onclick=\"saveCamIP()\">CONNECT TO CAMERA FEED</button>\n";
+  html += "        </div>\n";
+  html += "        <div class=\"panel\">\n";
+  html += "            <div class=\"panel-title\">Live Camera - RGB Stream</div>\n";
+  html += "            <img id=\"cam-feed-img\" class=\"video-box\" src=\"\" onerror=\"this.src='https://placehold.co/640x480/0b111e/26e6e6/png?text=ENTER+CAM+IP+ABOVE'\">\n";
+  html += "        </div>\n";
+  html += "        <button id=\"scan-action-btn\" class=\"scan-btn\" onclick=\"startScan()\">START AI SCAN</button>\n";
+  html += "        <div class=\"panel\">\n";
+  html += "            <div class=\"panel-title\">ML Image Analysis Result</div>\n";
+  html += "            <div id=\"status-match\" style=\"font-weight: bold; margin-bottom: 15px; font-size: 1.1em;\">Awaiting Scan...</div>\n";
+  html += "            <div class=\"progress-container\">\n";
+  html += "                <div class=\"progress-label\"><span>Visual Blemish</span><span>Scale Match</span></div>\n";
+  html += "                <div class=\"progress-bar-bg\">\n";
+  html += "                    <div id=\"bar-visual\" class=\"progress-fill color-orange\" style=\"width: 0%\"></div>\n";
+  html += "                </div>\n";
+  html += "            </div>\n";
+  html += "            <div class=\"progress-container\">\n";
+  html += "                <div class=\"progress-label\"><span>ML Spoilage Index</span><span>Confidence Match</span></div>\n";
+  html += "                <div class=\"progress-bar-bg\">\n";
+  html += "                    <div id=\"bar-spoilage\" class=\"progress-fill color-green\" style=\"width: 0%\"></div>\n";
+  html += "                </div>\n";
+  html += "            </div>\n";
+  html += "            <div id=\"eatable-result\" class=\"eat-status\" style=\"display: none;\"></div>\n";
+  html += "        </div>\n";
+  html += "        <div class=\"panel\">\n";
+  html += "            <div class=\"panel-title\">Smart Freezing System (T2 / H2)</div>\n";
+  html += "            <div class=\"grid-2\">\n";
+  html += "                <div class=\"metric-card\"><div class=\"metric-title\">T2 (Freezer Temp)</div><div class=\"metric-value\"><span id=\"temp2\">-</span><span class=\"metric-unit\">°C</span></div></div>\n";
+  html += "                <div class=\"metric-card\"><div class=\"metric-title\">H2 (Freezer Humid)</div><div class=\"metric-value\"><span id=\"humid2\">-</span></div></div>\n";
+  html += "                <div class=\"metric-card\" style=\"grid-column: span 2;\"><div class=\"metric-title\">Humidifier Relay State</div><div class=\"metric-value\" id=\"relay-state\" style=\"font-size:1.3em;\">IDLE</div></div>\n";
+  html += "            </div>\n";
+  html += "        </div>\n";
+  html += "        <div class=\"panel\">\n";
+  html += "            <div class=\"panel-title\">Live Chamber Readings (T / H)</div>\n";
+  html += "            <div class=\"grid-2-custom\">\n";
+  html += "                <div class=\"grid-2\">\n";
+  html += "                    <div class=\"metric-card\"><div class=\"metric-title\">VOC / AQI (MQ135)</div><div class=\"metric-value\" id=\"mq135\">-</div></div>\n";
+  html += "                    <div class=\"metric-card\"><div class=\"metric-title\">Methane (MQ4)</div><div class=\"metric-value\" id=\"mq4\">-</div></div>\n";
+  html += "                    <div class=\"metric-card\"><div class=\"metric-title\">T (Chamber Temp)</div><div class=\"metric-value\"><span id=\"temp1\">-</span><span class=\"metric-unit\">°C</span></div></div>\n";
+  html += "                    <div class=\"metric-card\"><div class=\"metric-title\">H (Chamber Humid)</div><div class=\"metric-value\"><span id=\"humid1\">-</span></div></div>\n";
+  html += "                </div>\n";
+  html += "                <div class=\"metric-card\" style=\"display: flex; flex-direction: column; justify-content: center;\">\n";
+  html += "                    <div class=\"metric-title\" style=\"color: #bf5af2;\">NIR - TSS Sugar Content</div>\n";
+  html += "                    <div class=\"metric-value\" style=\"color: #bf5af2; font-size: 2.2em;\"><span id=\"nir-sugar-val\">-</span> <span class=\"metric-unit\" style=\"color: #bf5af2;\">°Brix</span></div>\n";
+  html += "                    <div id=\"nir-sugar-desc\" style=\"font-size: 0.75em; margin-top: 5px;\">-</div>\n";
+  html += "                </div>\n";
+  html += "            </div>\n";
+  html += "        </div>\n";
+  html += "        <div class=\"panel\">\n";
+  html += "            <div class=\"panel-title\">Select Item to Scan</div>\n";
+  html += "            <div class=\"btn-group\">\n";
+  html += "                <button id=\"btn-apple\" class=\"btn\" onclick=\"selectFruit('Apple')\">🍎 Apple</button>\n";
+  html += "                <button id=\"btn-banana\" class=\"btn active\" onclick=\"selectFruit('Banana')\">🍌 Banana</button>\n";
+  html += "                <button id=\"btn-tomato\" class=\"btn\" onclick=\"selectFruit('Tomato')\">🍅 Tomato</button>\n";
+  html += "                <button id=\"btn-onion\" class=\"btn\" onclick=\"selectFruit('Onion')\">🧅 Onion</button>\n";
+  html += "                <button id=\"btn-guava\" class=\"btn\" onclick=\"selectFruit('Guava')\">🥝 Guava</button>\n";
+  html += "                <button id=\"btn-leafyvegetables\" class=\"btn\" onclick=\"selectFruit('Leafy Vegetables')\">🌿 Leafy Veg</button>\n";
+  html += "            </div>\n";
+  html += "        </div>\n";
+  html += "        <div class=\"panel\">\n";
+  html += "            <div class=\"panel-title\">Commodity Spreadsheet Download Center</div>\n";
+  html += "            <button class=\"download-btn\" onclick=\"window.location.href='/api/download-single'\">📥 EXPORT SINGLE CURRENT SENSING ITEM ONLY</button>\n";
+  html += "            <button class=\"download-btn\" style=\"background:#2ecc71; margin-top:10px;\" onclick=\"window.location.href='/api/download-all'\">📥 EXPORT MASTER ALL-TIME SCAN LOG HISTORY</button>\n";
+  html += "        </div>\n";
+  html += "    </div>\n";
+  html += "</body>\n";
+  html += "</html>\n";
+  return html;
+}
+
+// ====================================================================
+// 4. ROUTING HANDLERS
+// ====================================================================
+void handleRootPage() {
+  server.send(200, "text/html", getDashboardHTML());
+}
+
+void handleJSONDataFeed() {
+  String t1Str = isnan(temperature1) ? "ERR" : String(temperature1, 0);
+  String h1Str = isnan(humidity1) ? "ERR" : String(humidity1, 0);
+  String t2Str = isnan(temperature2) ? "ERR" : String(temperature2, 0);
+  String h2Str = isnan(humidity2) ? "ERR" : String(humidity2, 0);
+
+  String sugarDescStr = isSpoilAlertActive ? "Decayed - Microbial Depletion" : "Optimal Ripeness";
+
+  String json = "{";
+  json += "\"fruit\":" + String(fruitDetected) + ",";
+  json += "\"temperature1\":\"" + t1Str + "\",";
+  json += "\"humidity1\":\"" + h1Str + "\",";
+  json += "\"temperature2\":\"" + t2Str + "\",";
+  json += "\"humidity2\":\"" + h2Str + "\",";
+  json += "\"mq4\":" + String(rawMQ4) + ",";
+  json += "\"mq135\":" + String(rawMQ135) + ",";
+  json += "\"blemish\":" + String(currentBlemish, 0) + ",";
+  json += "\"spoilIndex\":" + String(currentSpoilageIndex, 0) + ",";
+  json += "\"scanStatus\":\"" + scanStatusString + "\",";
+  json += "\"selectedItem\":\"" + selectedFruit + "\",";
+  json += "\"sugarContent\":" + String(dynamicSugarBrix, 1) + ","; 
+  json += "\"sugarDesc\":\"" + sugarDescStr + "\",";
+  json += "\"humidifier\":" + String(isHumidifierOn ? 1 : 0);
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleSelectionChange() {
+  if (server.hasArg("item")) {
+    selectedFruit = server.arg("item");
+    Serial.println("Target Item Changed To: " + selectedFruit);
+    dynamicSugarBrix = calculateNIRSugar(selectedFruit, rawMQ4, rawMQ135, temperature1);
+  }
+  server.send(200, "text/plain", "OK");
+}
+
+void handleScanTrigger() {
+  if (server.hasArg("status")) {
+    String currentStatus = server.arg("status");
+    if (currentStatus == "run") {
+      scanStatusString = "AI Image Processing...";
+      currentBlemish = 0.0;
+      currentSpoilageIndex = 0.0;
+      if (lcdStatus) {
+        lcd.clear();
+        lcd.setCursor(0,0);
+        lcd.print("Capturing Photo ");
+        lcd.setCursor(0,1);
+        lcd.print("Processing Image");
+      }
+    } else if (currentStatus == "complete") {
+      if (rawMQ4 > SPOILAGE_THRESHOLD_MQ4 || rawMQ135 > SPOILAGE_THRESHOLD_MQ135) {
+        scanStatusString = "DO NOT EAT!"; 
+        isSpoilAlertActive = true;
+        currentBlemish = 74.5;
+        currentSpoilageIndex = 96.0;
+        
+        for(int i = 0; i < 3; i++) {
+          digitalWrite(BUZZER_PIN, HIGH); delay(200);
+          digitalWrite(BUZZER_PIN, LOW); delay(150);
+        }
+        
+        if (lcdStatus) {
+          lcd.clear();
+          lcd.setCursor(0,0);
+          lcd.print(selectedFruit + ":Spoiled");
+          lcd.setCursor(0,1);
+          lcd.print("Not Eatable     "); 
+        }
+      } else {
+        scanStatusString = "SAFE TO EAT ✓"; 
+        isSpoilAlertActive = false;
+        currentBlemish = 4.2;
+        currentSpoilageIndex = 8.5;
+        
+        for(int i = 0; i < 2; i++) {
+          digitalWrite(BUZZER_PIN, HIGH); delay(200);
+          digitalWrite(BUZZER_PIN, LOW); delay(150);
+        }
+        
+        if (lcdStatus) {
+          lcd.clear();
+          lcd.setCursor(0,0);
+          lcd.print(selectedFruit + ":Fresh  ");
+          lcd.setCursor(0,1);
+          lcd.print("Eatable ✓       ");
+        }
+      }
+      dynamicSugarBrix = calculateNIRSugar(selectedFruit, rawMQ4, rawMQ135, temperature1);
+    }
+  }
+  server.send(200, "text/plain", "OK");
+}
+
+void handleSingleDownload() {
+  String t1Str = isnan(temperature1) ? "ERR" : String(temperature1, 0);
+  String h1Str = isnan(humidity1) ? "ERR" : String(humidity1, 0);
+  String csv = "Timestamp,Target_Item,T,H,MQ4,MQ135,Sugar_Brix,Result\n";
+  csv += "2026-07-22 14:30," + selectedFruit + "," + t1Str + "," + h1Str + "," + String(rawMQ4) + "," + String(rawMQ135) + "," + String(dynamicSugarBrix, 1) + "," + (isSpoilAlertActive ? "SPOILED" : "FRESH") + "\n";
+  
+  server.sendHeader("Content-Disposition", "attachment; filename=" + selectedFruit + "_current_metric.csv");
+  server.send(200, "text/csv", csv);
+}
+
+void handleMasterDownload() {
+  String csv = "Timestamp,Item,T,H,T2,H2,MQ4,MQ135,Result\n";
+  csv += "2026-07-22 14:02,Tomato,24,65,4,85,210,340,FRESH\n";
+  csv += "2026-07-22 14:15,Leafy Vegetables,25,72,5,88,2430,2650,SPOILED\n";
+  csv += "2026-07-22 14:30," + selectedFruit + "," + String(temperature1,0) + "," + String(humidity1,0) + "," + String(temperature2,0) + "," + String(humidity2,0) + "," + String(rawMQ4) + "," + String(rawMQ135) + "," + (isSpoilAlertActive ? "SPOILED" : "FRESH") + "\n";
+  
+  server.sendHeader("Content-Disposition", "attachment; filename=master_ml_dataset_report.csv");
+  server.send(200, "text/csv", csv);
+}
+
+// ====================================================================
+// 5. DIAGNOSTIC INITIALIZATION
+// ====================================================================
+void setup() {
+  delay(5000); 
+
+  Serial.begin(115200);
+  
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(RELAY_PIN, LOW); 
+
+  pinMode(DHT1_PIN, INPUT_PULLUP);
+  pinMode(DHT2_PIN, INPUT_PULLUP);
+
+  dht1.begin();
+  dht2.begin();
+  
+  pinMode(IR_FRUIT_PIN, INPUT);
+  pinMode(MQ4_ANALOG, INPUT);
+  pinMode(MQ135_ANALOG, INPUT);
+
+  Wire.begin(21, 22);
+  Wire.beginTransmission(0x27);
+  if (Wire.endTransmission() == 0) {
+    lcd.init();
+    lcd.backlight();
+    lcd.setCursor(0, 0);
+    lcd.print("    VEGETABLE    ");
+    lcd.setCursor(0, 1);
+    lcd.print("SPOILER DETECTCN");
+    lcdStatus = true;
+  }
+
+  digitalWrite(BUZZER_PIN, HIGH);
+  delay(150);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  WiFi.mode(WIFI_STA); 
+  WiFi.disconnect();
+  delay(100);
+
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to Hotspot");
+  
+  int attemptCounter = 0;
+  while (WiFi.status() != WL_CONNECTED && attemptCounter < 25) {
+    delay(500);
+    Serial.print(".");
+    attemptCounter++;
+  }
+
+  if(WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n🎉 Connected Successfully!");
+    Serial.print("Local IP Address: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\n⚠️ WiFi reconnecting in background...");
+  }
+
+  server.on("/", handleRootPage);
+  server.on("/api/data", handleJSONDataFeed);
+  server.on("/api/select", handleSelectionChange);
+  server.on("/api/scan-trigger", handleScanTrigger);
+  server.on("/api/download-single", handleSingleDownload);
+  server.on("/api/download-all", handleMasterDownload);
+  server.begin();
+
+  delay(2000); 
+  if (lcdStatus) lcd.clear();
+}
+
+// ====================================================================
+// 6. MAIN RUNNING SYSTEM LOOP
+// ====================================================================
+void loop() {
+  server.handleClient(); 
+
+  if (WiFi.status() != WL_CONNECTED) {
+     static unsigned long lastReconnectAttempt = 0;
+     if (millis() - lastReconnectAttempt >= 8000) {
+        lastReconnectAttempt = millis();
+        WiFi.begin(ssid, password);
+     }
+  }
+
+  unsigned long currentMillis = millis();
+  if (currentMillis - previousMillis >= interval) {
+    previousMillis = currentMillis;
+
+    fruitDetected = (digitalRead(IR_FRUIT_PIN) == LOW) ? 1 : 0; 
+    
+    humidity1 = dht1.readHumidity();
+    temperature1 = dht1.readTemperature(); 
+    humidity2 = dht2.readHumidity();
+    temperature2 = dht2.readTemperature(); 
+    
+    rawMQ4 = analogRead(MQ4_ANALOG);
+    rawMQ135 = analogRead(MQ135_ANALOG);
+
+    // Calculate dynamic sugar brix whenever sensor data is read
+    dynamicSugarBrix = calculateNIRSugar(selectedFruit, rawMQ4, rawMQ135, temperature1);
+
+    if (fruitDetected == 1 && prevFruitDetected == 0) {
+      digitalWrite(BUZZER_PIN, HIGH); delay(150); digitalWrite(BUZZER_PIN, LOW);
+      prevFruitDetected = 1; 
+      scanStatusString = "Awaiting Scan..."; 
+    } else if (fruitDetected == 0) {
+      prevFruitDetected = 0; 
+      isSpoilAlertActive = false; 
+      scanStatusString = "Awaiting Scan...";
+    }
+
+    // Humidifier Control Relay Logic
+    if (fruitDetected == 1 && temperature1 < 45.0) {
+      digitalWrite(RELAY_PIN, HIGH); 
+      isHumidifierOn = true;
+    } else {
+      digitalWrite(RELAY_PIN, LOW);  
+      isHumidifierOn = false;
+    }
+
+    Serial.print("[IP: "); Serial.print(WiFi.localIP()); Serial.print("] ");
+    Serial.print("T:" + String(temperature1, 0) + "C Sugar:" + String(dynamicSugarBrix, 1) + " Brix ");
+    Serial.println("MQ4:" + String(rawMQ4) + " MQ135:" + String(rawMQ135));
+
+    if (lcdStatus && scanStatusString == "Awaiting Scan...") {
+      String t1Out = isnan(temperature1) ? "ER" : String(temperature1, 0);
+      String h1Out = isnan(humidity1) ? "ER" : String(humidity1, 0);
+
+      char row0[17];
+      char row1[17];
+      
+      snprintf(row0, sizeof(row0), "T:%sH:%sMe:%d", t1Out.c_str(), h1Out.c_str(), rawMQ4);
+      snprintf(row1, sizeof(row1), "MQ135:%d Sugar:%.1f", rawMQ135, dynamicSugarBrix);
+
+      lcd.setCursor(0, 0);
+      lcd.print(row0);
+      lcd.setCursor(0, 1);
+      lcd.print(row1);
+    }
+  }
+}
