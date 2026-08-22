@@ -1,0 +1,202 @@
+#include "esp_camera.h"
+#include <WiFi.h>
+#include "esp_http_server.h"
+
+// ====================================================================
+// WI-FI CREDENTIALS
+// ====================================================================
+const char *ssid     = "YOUR_SSID";
+const char *password = "YOUR_PASSWORD";
+
+// Stream Header Definitions
+#define PART_BOUNDARY "123456789000000000000987654321"
+static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
+static const char* _STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
+static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
+
+httpd_handle_t wrover_stream_httpd = NULL;
+
+// ====================================================================
+// PIN MAPPING STRUCTURES
+// ====================================================================
+void setWroverKitPins(camera_config_t &config) {
+  config.pin_pwdn = -1;
+  config.pin_reset = -1;
+  config.pin_xclk = 4;
+  config.pin_sscb_sda = 18;
+  config.pin_sscb_scl = 23;
+  config.pin_d7 = 36;
+  config.pin_d6 = 37;
+  config.pin_d5 = 38;
+  config.pin_d4 = 39;
+  config.pin_d3 = 35;
+  config.pin_d2 = 14;
+  config.pin_d1 = 13;
+  config.pin_d0 = 34;
+  config.pin_vsync = 5;
+  config.pin_href = 27;
+  config.pin_pclk = 25;
+}
+
+void setAiThinkerPins(camera_config_t &config) {
+  config.pin_pwdn = 32;
+  config.pin_reset = -1;
+  config.pin_xclk = 0;
+  config.pin_sscb_sda = 26;
+  config.pin_sscb_scl = 27;
+  config.pin_d7 = 35;
+  config.pin_d6 = 34;
+  config.pin_d5 = 39;
+  config.pin_d4 = 36;
+  config.pin_d3 = 21;
+  config.pin_d2 = 19;
+  config.pin_d1 = 18;
+  config.pin_d0 = 5;
+  config.pin_vsync = 25;
+  config.pin_href = 23;
+  config.pin_pclk = 22;
+}
+
+// ====================================================================
+// HTTP STREAM HANDLER
+// ====================================================================
+static esp_err_t wrover_stream_handler(httpd_req_t *req) {
+  camera_fb_t * fb = NULL;
+  esp_err_t res = ESP_OK;
+  char part_buf[64];
+
+  res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
+  if (res != ESP_OK) return res;
+
+  while (true) {
+    fb = esp_camera_fb_get();
+    if (!fb) {
+      Serial.println("Camera capture failed");
+      res = ESP_FAIL;
+    } else {
+      size_t hlen = snprintf((char *)part_buf, 64, _STREAM_PART, fb->len);
+      res = httpd_resp_send_chunk(req, (const char *)part_buf, hlen);
+      if (res == ESP_OK) {
+        res = httpd_resp_send_chunk(req, (const char *)fb->buf, fb->len);
+      }
+      if (res == ESP_OK) {
+        res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
+      }
+      esp_camera_fb_return(fb);
+      fb = NULL;
+    }
+
+    if (res != ESP_OK) {
+      break;
+    }
+
+    // Small delay to prevent Watchdog resets during continuous streaming
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+  }
+  return res;
+}
+
+// ====================================================================
+// START WEB SERVER
+// ====================================================================
+void startWroverCameraServer() {
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  config.server_port = 80;
+
+  httpd_uri_t stream_uri = {
+    .uri      = "/",
+    .method   = HTTP_GET,
+    .handler  = wrover_stream_handler,
+    .user_ctx = NULL
+  };
+  
+  if (httpd_start(&wrover_stream_httpd, &config) == ESP_OK) {
+    httpd_register_uri_handler(wrover_stream_httpd, &stream_uri);
+  }
+}
+
+// ====================================================================
+// MAIN SETUP
+// ====================================================================
+void setup() {
+  Serial.begin(115200);
+  Serial.setDebugOutput(true);
+  Serial.println();
+
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  
+  // Lower XCLK frequency to 10MHz to fix noise and probe timeouts
+  config.xclk_freq_hz = 10000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+  
+  if (psramFound()) {
+    config.frame_size = FRAMESIZE_VGA; 
+    config.jpeg_quality = 10;
+    config.fb_count = 2;
+    config.grab_mode = CAMERA_GRAB_LATEST;
+    config.fb_location = CAMERA_FB_IN_PSRAM;
+    Serial.println("PSRAM detected: Running high-performance mode.");
+  } else {
+    config.frame_size = FRAMESIZE_SVGA;
+    config.jpeg_quality = 12;
+    config.fb_count = 1;
+    config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+    config.fb_location = CAMERA_FB_IN_DRAM;
+    Serial.println("PSRAM not detected: Running DRAM mode.");
+  }
+
+  // --- AUTOMATIC CAMERA PROBE ---
+  Serial.println("Testing Configuration 1: ESP32-WROVER-KIT / ESP-EYE Pinout...");
+  setWroverKitPins(config);
+  esp_err_t err = esp_camera_init(&config);
+
+  if (err != ESP_OK) {
+    Serial.printf("Config 1 failed (0x%x). Testing Configuration 2: Standard/AI-Thinker Pinout...\n", err);
+    esp_camera_deinit();
+    
+    setAiThinkerPins(config);
+    err = esp_camera_init(&config);
+  }
+
+  if (err != ESP_OK) {
+    Serial.printf("\n❌ Camera init failed with error 0x%x\n", err);
+    Serial.println("Troubleshooting Check:");
+    Serial.println("1. Ensure the camera ribbon cable is firmly pressed down into its socket.");
+    Serial.println("2. Ensure the board is powered with a stable 5V supply (USB ports can drop voltage).");
+    return;
+  }
+
+  Serial.println("\n✅ Camera Hardware Initialized Successfully!");
+
+  sensor_t * s = esp_camera_sensor_get();
+  if (s) {
+    s->set_vflip(s, 0);        
+    s->set_hmirror(s, 0);      
+    s->set_brightness(s, 2);   
+    s->set_contrast(s, 1);     
+    s->set_saturation(s, 1);   
+  }
+
+  WiFi.begin(ssid, password);
+  WiFi.setSleep(false);
+  
+  Serial.print("Connecting to Wi-Fi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  
+  Serial.println("\n🎉 Wi-Fi Connected!");
+  startWroverCameraServer();
+  
+  Serial.println("==============================================");
+  Serial.print("Stream URL: http://");
+  Serial.println(WiFi.localIP());
+  Serial.println("==============================================");
+}
+
+void loop() {
+  delay(10000); 
+}
